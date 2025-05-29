@@ -62,6 +62,14 @@ export class Viewer {
 		this.clips = [];
 		this.gui = null;
 
+		// Recording state
+		this.isRecording = false;
+		this.mediaRecorder = null;
+		this.recordedChunks = [];
+		this.recordingStartAngle = 0;
+		this.recordingTotalRotation = 0;
+		this.recordingLastAngle = 0;
+
 		this.state = {
 			environment:
 				options.preset === Preset.ASSET_GENERATOR
@@ -148,6 +156,10 @@ export class Viewer {
 		this.controls.update();
 		this.stats.update();
 		this.mixer && this.mixer.update(dt);
+		
+		// Check for recording completion during auto-rotation
+		this.checkRotationComplete();
+		
 		this.render();
 
 		this.prevTime = time;
@@ -333,9 +345,143 @@ export class Viewer {
 
 	playAllClips() {
 		this.clips.forEach((clip) => {
-			this.mixer.clipAction(clip).reset().play();
-			this.state.actionStates[clip.name] = true;
+			this.mixer.clipAction(clip).play();
 		});
+	}
+
+	// Recording functionality
+	async startRecording() {
+		if (this.isRecording) return;
+
+		try {
+			// Set up canvas stream
+			const stream = this.renderer.domElement.captureStream(30); // 30 FPS
+			
+			// Configure MediaRecorder
+			const options = { 
+				mimeType: 'video/webm; codecs=vp9',
+				videoBitsPerSecond: 2500000 // 2.5 Mbps for good quality
+			};
+			
+			// Fallback for browsers that don't support vp9
+			if (!MediaRecorder.isTypeSupported(options.mimeType)) {
+				options.mimeType = 'video/webm; codecs=vp8';
+			}
+			
+			this.mediaRecorder = new MediaRecorder(stream, options);
+			this.recordedChunks = [];
+
+			this.mediaRecorder.ondataavailable = (event) => {
+				if (event.data.size > 0) {
+					this.recordedChunks.push(event.data);
+				}
+			};
+
+			this.mediaRecorder.onstop = () => {
+				this.saveRecording();
+			};
+
+			// Start recording
+			this.mediaRecorder.start();
+			this.isRecording = true;
+
+			// Store initial camera angle and disable manual controls
+			this.recordingStartAngle = this.controls.getAzimuthalAngle();
+			this.recordingTotalRotation = 0;
+			this.recordingLastAngle = this.recordingStartAngle;
+			this.controls.enabled = false;
+			this.controls.autoRotate = true;
+			this.controls.autoRotateSpeed = 1.0; // 1 rotation per 30 seconds at 60fps
+
+			// Update GUI
+			if (this.recordButton) {
+				this.recordButton.name('Stop Recording');
+			}
+			if (this.statusCtrl) {
+				this.statusCtrl.updateDisplay();
+			}
+
+			console.log('Recording started - 360° rotation in progress...');
+
+		} catch (error) {
+			console.error('Error starting recording:', error);
+			alert('Failed to start recording. Please ensure your browser supports video recording.');
+		}
+	}
+
+	stopRecording() {
+		if (!this.isRecording) return;
+
+		this.isRecording = false;
+		this.controls.enabled = true;
+		this.controls.autoRotate = false;
+
+		if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
+			this.mediaRecorder.stop();
+		}
+
+		// Update GUI
+		if (this.recordButton) {
+			this.recordButton.name('Record 360°');
+		}
+		if (this.statusCtrl) {
+			this.statusCtrl.updateDisplay();
+		}
+
+		console.log('Recording stopped');
+	}
+
+	saveRecording() {
+		if (this.recordedChunks.length === 0) return;
+
+		const blob = new Blob(this.recordedChunks, { type: 'video/webm' });
+		const url = URL.createObjectURL(blob);
+		
+		// Create download link
+		const a = document.createElement('a');
+		a.href = url;
+		a.download = `gltf-360-rotation-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.webm`;
+		document.body.appendChild(a);
+		a.click();
+		document.body.removeChild(a);
+		
+		// Clean up
+		URL.revokeObjectURL(url);
+		this.recordedChunks = [];
+
+		console.log('Recording saved');
+	}
+
+	// Check if one full rotation is complete during recording
+	checkRotationComplete() {
+		if (!this.isRecording) return;
+
+		const currentAngle = this.controls.getAzimuthalAngle();
+		
+		// Calculate the rotation delta since last check
+		let angleDelta = currentAngle - this.recordingLastAngle;
+		
+		// Handle angle wrapping (when angle goes from ~2π to ~0 or vice versa)
+		if (angleDelta > Math.PI) {
+			angleDelta -= 2 * Math.PI;
+		} else if (angleDelta < -Math.PI) {
+			angleDelta += 2 * Math.PI;
+		}
+		
+		// Accumulate the total rotation
+		this.recordingTotalRotation += Math.abs(angleDelta);
+		this.recordingLastAngle = currentAngle;
+
+		// Debug logging every 60 frames (about once per second at 60fps)
+		if (Math.random() < 0.016) { // ~1/60 chance
+			console.log(`Recording progress - Total rotation: ${this.recordingTotalRotation.toFixed(3)} / ${(2 * Math.PI).toFixed(3)} radians (${(this.recordingTotalRotation / (2 * Math.PI) * 100).toFixed(1)}%)`);
+		}
+
+		// Stop recording after one complete rotation (2π radians) with small tolerance
+		if (this.recordingTotalRotation >= (2 * Math.PI - 0.1)) {
+			console.log('Full 360° rotation completed, stopping recording');
+			this.stopRecording();
+		}
 	}
 
 	/**
@@ -570,6 +716,28 @@ export class Viewer {
 			if (this.mixer) this.mixer.timeScale = speed;
 		});
 		this.animFolder.add({ playAll: () => this.playAllClips() }, 'playAll');
+
+		// Recording controls.
+		const recordFolder = gui.addFolder('Recording');
+		const recordController = {
+			record360: () => {
+				if (this.isRecording) {
+					this.stopRecording();
+				} else {
+					this.startRecording();
+				}
+			},
+			status: () => this.isRecording ? 'Recording...' : 'Ready'
+		};
+		
+		recordFolder.add(recordController, 'record360').name(this.isRecording ? 'Stop Recording' : 'Record 360°');
+		const statusCtrl = recordFolder.add(recordController, 'status').name('Status');
+		statusCtrl.domElement.style.pointerEvents = 'none'; // Make status read-only
+		
+		// Store reference to update the button text
+		this.recordController = recordController;
+		this.recordButton = recordFolder.__controllers[0]; // First controller is the record button
+		this.statusCtrl = statusCtrl;
 
 		// Morph target controls.
 		this.morphFolder = gui.addFolder('Morph Targets');
